@@ -842,7 +842,18 @@ TSharedPtr<FJsonValue> FLevelHandlers::SpawnLight(const TSharedPtr<FJsonObject>&
 		return MCPError(FString::Printf(TEXT("Unknown light type: %s. Use point, spot, directional, rect, or sky."), *LightType));
 	}
 
-	FTransform LightTransform(FRotator::ZeroRotator, Location);
+	FRotator Rotation = FRotator::ZeroRotator;
+	const TSharedPtr<FJsonObject>* RotObj = nullptr;
+	if (Params->TryGetObjectField(TEXT("rotation"), RotObj) && RotObj && (*RotObj).IsValid())
+	{
+		double Pitch = 0.0, Yaw = 0.0, Roll = 0.0;
+		(*RotObj)->TryGetNumberField(TEXT("pitch"), Pitch);
+		(*RotObj)->TryGetNumberField(TEXT("yaw"), Yaw);
+		(*RotObj)->TryGetNumberField(TEXT("roll"), Roll);
+		Rotation = FRotator((float)Pitch, (float)Yaw, (float)Roll);
+	}
+
+	FTransform LightTransform(Rotation, Location);
 	AActor* NewLight = World->SpawnActor<AActor>(LightClass, LightTransform);
 	if (!NewLight)
 	{
@@ -854,15 +865,59 @@ TSharedPtr<FJsonValue> FLevelHandlers::SpawnLight(const TSharedPtr<FJsonObject>&
 		NewLight->SetActorLabel(Label);
 	}
 
+	// Parse optional color (RGB 0-255 each, matches set_light_properties shape).
+	auto ParseLightColor = [&](FLinearColor& OutColor) -> bool
+	{
+		const TSharedPtr<FJsonObject>* ColorObj = nullptr;
+		if (!Params->TryGetObjectField(TEXT("color"), ColorObj) || !ColorObj || !(*ColorObj).IsValid())
+		{
+			return false;
+		}
+		double R = 255.0, G = 255.0, B = 255.0;
+		(*ColorObj)->TryGetNumberField(TEXT("r"), R);
+		(*ColorObj)->TryGetNumberField(TEXT("g"), G);
+		(*ColorObj)->TryGetNumberField(TEXT("b"), B);
+		OutColor = FLinearColor(R / 255.0f, G / 255.0f, B / 255.0f);
+		return true;
+	};
+
+	// Parse optional mobility (#310). Default to Movable so the light renders
+	// immediately without a lighting build — that matches the "spawn this and
+	// it just works" UX MCP callers expect. SkyLight ignores this.
+	const FString MobilityStr = OptionalString(Params, TEXT("mobility"), TEXT("Movable"));
+	EComponentMobility::Type Mobility = EComponentMobility::Movable;
+	if (MobilityStr.Equals(TEXT("Static"), ESearchCase::IgnoreCase))
+	{
+		Mobility = EComponentMobility::Static;
+	}
+	else if (MobilityStr.Equals(TEXT("Stationary"), ESearchCase::IgnoreCase))
+	{
+		Mobility = EComponentMobility::Stationary;
+	}
+
 	if (ULightComponent* LightComponent = NewLight->FindComponentByClass<ULightComponent>())
 	{
+		LightComponent->SetMobility(Mobility);
 		LightComponent->SetIntensity(Intensity);
+		FLinearColor LightColor;
+		if (ParseLightColor(LightColor))
+		{
+			LightComponent->SetLightColor(LightColor);
+		}
+		LightComponent->SetVisibility(true);
+		LightComponent->MarkRenderStateDirty();
 	}
 	else if (USkyLightComponent* SkyComp = NewLight->FindComponentByClass<USkyLightComponent>())
 	{
 		// SkyLight has no ULightComponent — set intensity on USkyLightComponent
 		// directly and recapture so the change takes effect.
 		SkyComp->SetIntensity(Intensity);
+		FLinearColor LightColor;
+		if (ParseLightColor(LightColor))
+		{
+			SkyComp->SetLightColor(LightColor);
+		}
+		SkyComp->SetVisibility(true);
 		SkyComp->RecaptureSky();
 	}
 
@@ -944,6 +999,24 @@ TSharedPtr<FJsonValue> FLevelHandlers::SetLightProperties(const TSharedPtr<FJson
 		(*RotObj)->TryGetNumberField(TEXT("yaw"), Yaw);
 		(*RotObj)->TryGetNumberField(TEXT("roll"), Roll);
 		Actor->SetActorRotation(FRotator((float)Pitch, (float)Yaw, (float)Roll));
+		bAnyChange = true;
+	}
+
+	// #310: mobility setter — static/stationary/movable.
+	FString MobilityStr;
+	if (Params->TryGetStringField(TEXT("mobility"), MobilityStr) && !MobilityStr.IsEmpty())
+	{
+		EComponentMobility::Type NewMobility = EComponentMobility::Movable;
+		if (MobilityStr.Equals(TEXT("Static"), ESearchCase::IgnoreCase))
+		{
+			NewMobility = EComponentMobility::Static;
+		}
+		else if (MobilityStr.Equals(TEXT("Stationary"), ESearchCase::IgnoreCase))
+		{
+			NewMobility = EComponentMobility::Stationary;
+		}
+		LightComponent->SetMobility(NewMobility);
+		LightComponent->MarkRenderStateDirty();
 		bAnyChange = true;
 	}
 
