@@ -294,15 +294,23 @@ TSharedPtr<FJsonValue> FLandscapeHandlers::GetLandscapeComponent(const TSharedPt
 
 TSharedPtr<FJsonValue> FLandscapeHandlers::SculptLandscape(const TSharedPtr<FJsonObject>& Params)
 {
-	const TSharedPtr<FJsonObject>* LocationObj = nullptr;
-	if (!Params->TryGetObjectField(TEXT("location"), LocationObj) || !LocationObj || !(*LocationObj).IsValid())
-	{
-		return MCPError(TEXT("Missing 'location' parameter (object with x, y)"));
-	}
-
 	double LocX = 0, LocY = 0;
-	(*LocationObj)->TryGetNumberField(TEXT("x"), LocX);
-	(*LocationObj)->TryGetNumberField(TEXT("y"), LocY);
+	bool bHasX = Params->TryGetNumberField(TEXT("x"), LocX);
+	bool bHasY = Params->TryGetNumberField(TEXT("y"), LocY);
+	if (!bHasX || !bHasY)
+	{
+		const TSharedPtr<FJsonObject>* LocationObj = nullptr;
+		if (Params->TryGetObjectField(TEXT("location"), LocationObj) && LocationObj && (*LocationObj).IsValid())
+		{
+			(*LocationObj)->TryGetNumberField(TEXT("x"), LocX);
+			(*LocationObj)->TryGetNumberField(TEXT("y"), LocY);
+			bHasX = bHasY = true;
+		}
+	}
+	if (!bHasX || !bHasY)
+	{
+		return MCPError(TEXT("Missing 'x'/'y' parameters (flat 'x','y' or nested 'location':{x,y})"));
+	}
 
 	double SculptRadius = OptionalNumber(Params, TEXT("radius"), 500.0);
 	double Strength = OptionalNumber(Params, TEXT("strength"), 0.5);
@@ -356,15 +364,23 @@ TSharedPtr<FJsonValue> FLandscapeHandlers::PaintLandscapeLayer(const TSharedPtr<
 	FString LayerName;
 	if (auto Err = RequireString(Params, TEXT("layerName"), LayerName)) return Err;
 
-	const TSharedPtr<FJsonObject>* LocationObj = nullptr;
-	if (!Params->TryGetObjectField(TEXT("location"), LocationObj) || !LocationObj || !(*LocationObj).IsValid())
-	{
-		return MCPError(TEXT("Missing 'location' parameter (object with x, y)"));
-	}
-
 	double LocX = 0, LocY = 0;
-	(*LocationObj)->TryGetNumberField(TEXT("x"), LocX);
-	(*LocationObj)->TryGetNumberField(TEXT("y"), LocY);
+	bool bHasX = Params->TryGetNumberField(TEXT("x"), LocX);
+	bool bHasY = Params->TryGetNumberField(TEXT("y"), LocY);
+	if (!bHasX || !bHasY)
+	{
+		const TSharedPtr<FJsonObject>* LocationObj = nullptr;
+		if (Params->TryGetObjectField(TEXT("location"), LocationObj) && LocationObj && (*LocationObj).IsValid())
+		{
+			(*LocationObj)->TryGetNumberField(TEXT("x"), LocX);
+			(*LocationObj)->TryGetNumberField(TEXT("y"), LocY);
+			bHasX = bHasY = true;
+		}
+	}
+	if (!bHasX || !bHasY)
+	{
+		return MCPError(TEXT("Missing 'x'/'y' parameters (flat 'x','y' or nested 'location':{x,y})"));
+	}
 
 	double PaintRadius = OptionalNumber(Params, TEXT("radius"), 500.0);
 	double Strength = OptionalNumber(Params, TEXT("strength"), 1.0);
