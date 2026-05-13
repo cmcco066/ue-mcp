@@ -18,6 +18,8 @@ export const widgetTool: ToolDef = categoryTool(
     add_widget:               bp("Add widget to widget tree. Params: assetPath, widgetClass, widgetName?, parentWidgetName?", "add_widget"),
     remove_widget:            bp("Remove widget from tree. Params: assetPath, widgetName", "remove_widget"),
     move_widget:              bp("Reparent widget. Params: assetPath, widgetName, newParentWidgetName", "move_widget"),
+    set_root:                 bp("Replace WBP root with an existing widget by name (#365). Params: assetPath, widgetName", "set_root_widget", (p) => ({ assetPath: p.assetPath, path: p.path, widgetName: p.widgetName })),
+    wrap_root:                bp("Wrap the current root in a new panel widget (UMG 'Wrap With'). Params: assetPath, wrapperClass (must be a UPanelWidget subclass), wrapperName? (#365)", "wrap_root_widget", (p) => ({ assetPath: p.assetPath, path: p.path, wrapperClass: p.wrapperClass, widgetClass: p.widgetClass, wrapperName: p.wrapperName })),
     list_classes:             bp("List available widget classes", "list_widget_classes"),
     list_runtime:             bp("(#160) List live UUserWidget instances in the PIE world. Params: classFilter?, namePrefix?, viewportOnly?", "list_runtime_widgets"),
     get_runtime:              bp("(#160) Inspect a live PIE widget tree with text/visibility/brush/percent values. Params: widgetName? | className?, childName?, maxDepth?", "get_runtime_widget"),
@@ -43,5 +45,8 @@ export const widgetTool: ToolDef = categoryTool(
     viewportOnly: z.boolean().optional().describe("list_runtime: only return widgets currently added to the viewport"),
     childName: z.string().optional().describe("get_runtime: restrict the tree walk to the named child inside the UserWidget"),
     maxDepth: z.number().optional().describe("get_runtime: max widget-tree depth to walk (default 6)"),
+    wrapperClass: z.string().optional().describe("wrap_root: panel widget class (CanvasPanel, VerticalBox, Overlay, etc.)"),
+    wrapperName: z.string().optional().describe("wrap_root: optional name for the new wrapper widget"),
+    path: z.string().optional().describe("Alias for assetPath"),
   },
 );

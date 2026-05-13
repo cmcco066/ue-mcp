@@ -74,6 +74,8 @@ void FWidgetHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("add_widget"), &AddWidget);
 	Registry.RegisterHandler(TEXT("remove_widget"), &RemoveWidget);
 	Registry.RegisterHandler(TEXT("move_widget"), &MoveWidget);
+	Registry.RegisterHandler(TEXT("set_root_widget"), &SetRoot);
+	Registry.RegisterHandler(TEXT("wrap_root_widget"), &WrapRoot);
 	Registry.RegisterHandler(TEXT("list_widget_classes"), &ListWidgetClasses);
 	Registry.RegisterHandler(TEXT("list_runtime_widgets"), &ListRuntimeWidgets);
 	Registry.RegisterHandler(TEXT("get_runtime_widget"), &GetRuntimeWidget);
@@ -1703,6 +1705,130 @@ TSharedPtr<FJsonValue> FWidgetHandlers::MoveWidget(const TSharedPtr<FJsonObject>
 		MCPSetRollback(Result, TEXT("move_widget"), Payload);
 	}
 
+	return MCPResult(Result);
+}
+
+// #365: replace the WBP's RootWidget with an existing widget by name. The
+// previous root is removed from the tree along with its descendants. Used
+// when an authoring step needs to swap a placeholder root (e.g. the
+// auto-created CanvasPanel) for a different layout.
+TSharedPtr<FJsonValue> FWidgetHandlers::SetRoot(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	if (auto Err = RequireStringAlt(Params, TEXT("assetPath"), TEXT("path"), AssetPath)) return Err;
+
+	FString WidgetName;
+	if (auto Err = RequireString(Params, TEXT("widgetName"), WidgetName)) return Err;
+
+	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
+	UWidgetBlueprint* WidgetBP = Cast<UWidgetBlueprint>(LoadedAsset);
+	if (!WidgetBP || !WidgetBP->WidgetTree)
+	{
+		return MCPError(FString::Printf(TEXT("Failed to load WidgetBlueprint at '%s'"), *AssetPath));
+	}
+
+	UWidget* NewRoot = nullptr;
+	WidgetBP->WidgetTree->ForEachWidget([&](UWidget* W)
+	{
+		if (W && W->GetName() == WidgetName) NewRoot = W;
+	});
+	if (!NewRoot)
+	{
+		return MCPError(FString::Printf(TEXT("Widget not found: '%s'"), *WidgetName));
+	}
+
+	UWidget* OldRoot = WidgetBP->WidgetTree->RootWidget;
+	if (OldRoot == NewRoot)
+	{
+		auto Noop = MCPSuccess();
+		MCPSetExisted(Noop);
+		Noop->SetStringField(TEXT("rootWidget"), WidgetName);
+		return MCPResult(Noop);
+	}
+
+	WidgetBP->Modify();
+	WidgetBP->WidgetTree->Modify();
+
+	// Detach NewRoot from its current parent so the engine doesn't keep it as
+	// a descendant of whatever was hosting it (avoids leaving the new root
+	// double-parented when AddChild later reassigns it elsewhere).
+	if (UPanelWidget* CurrentParent = NewRoot->GetParent())
+	{
+		CurrentParent->RemoveChild(NewRoot);
+	}
+
+	WidgetBP->WidgetTree->RootWidget = NewRoot;
+
+	WidgetBP->MarkPackageDirty();
+	FKismetEditorUtilities::CompileBlueprint(WidgetBP);
+	UEditorAssetLibrary::SaveAsset(AssetPath);
+
+	auto Result = MCPSuccess();
+	MCPSetUpdated(Result);
+	Result->SetStringField(TEXT("rootWidget"), WidgetName);
+	Result->SetStringField(TEXT("previousRoot"), OldRoot ? OldRoot->GetName() : TEXT("(none)"));
+	return MCPResult(Result);
+}
+
+// #365: insert a new container around the current root - mirrors UMG's
+// "Wrap With" context-menu action. The current root becomes a child of the
+// new wrapping widget.
+TSharedPtr<FJsonValue> FWidgetHandlers::WrapRoot(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	if (auto Err = RequireStringAlt(Params, TEXT("assetPath"), TEXT("path"), AssetPath)) return Err;
+
+	FString WrapperClassName;
+	if (auto Err = RequireStringAlt(Params, TEXT("wrapperClass"), TEXT("widgetClass"), WrapperClassName)) return Err;
+
+	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
+	UWidgetBlueprint* WidgetBP = Cast<UWidgetBlueprint>(LoadedAsset);
+	if (!WidgetBP || !WidgetBP->WidgetTree)
+	{
+		return MCPError(FString::Printf(TEXT("Failed to load WidgetBlueprint at '%s'"), *AssetPath));
+	}
+
+	UWidget* OldRoot = WidgetBP->WidgetTree->RootWidget;
+	if (!OldRoot)
+	{
+		return MCPError(TEXT("WBP has no root widget yet - use add_widget to set a root first"));
+	}
+
+	UClass* WrapperCls = FindClassByShortName(WrapperClassName);
+	if (!WrapperCls)
+	{
+		return MCPError(FString::Printf(TEXT("Widget class not found: %s"), *WrapperClassName));
+	}
+	if (!WrapperCls->IsChildOf(UPanelWidget::StaticClass()))
+	{
+		return MCPError(FString::Printf(
+			TEXT("Wrapper class '%s' is not a UPanelWidget - cannot host children"), *WrapperClassName));
+	}
+
+	const FString NewName = OptionalString(Params, TEXT("wrapperName"));
+
+	WidgetBP->Modify();
+	WidgetBP->WidgetTree->Modify();
+
+	UPanelWidget* Wrapper = Cast<UPanelWidget>(WidgetBP->WidgetTree->ConstructWidget<UWidget>(
+		WrapperCls, NewName.IsEmpty() ? NAME_None : FName(*NewName)));
+	if (!Wrapper)
+	{
+		return MCPError(TEXT("Failed to construct wrapper widget"));
+	}
+
+	WidgetBP->WidgetTree->RootWidget = Wrapper;
+	Wrapper->AddChild(OldRoot);
+
+	WidgetBP->MarkPackageDirty();
+	FKismetEditorUtilities::CompileBlueprint(WidgetBP);
+	UEditorAssetLibrary::SaveAsset(AssetPath);
+
+	auto Result = MCPSuccess();
+	MCPSetCreated(Result);
+	Result->SetStringField(TEXT("wrapperName"), Wrapper->GetName());
+	Result->SetStringField(TEXT("wrapperClass"), WrapperCls->GetName());
+	Result->SetStringField(TEXT("wrappedChild"), OldRoot->GetName());
 	return MCPResult(Result);
 }
 
