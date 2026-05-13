@@ -71,6 +71,8 @@ void FAnimationHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("create_montage"), &CreateMontage);
 	Registry.RegisterHandler(TEXT("create_anim_montage"), &CreateMontage);  // alias used by TS tools
 	Registry.RegisterHandler(TEXT("create_blendspace"), &CreateBlendspace);
+	Registry.RegisterHandler(TEXT("add_blend_sample"), &AddBlendSample);
+	Registry.RegisterHandler(TEXT("set_blend_sample"), &SetBlendSample);
 	Registry.RegisterHandler(TEXT("read_blendspace"), &ReadBlendspace);
 	Registry.RegisterHandler(TEXT("add_anim_notify"), &AddAnimNotify);
 	Registry.RegisterHandler(TEXT("create_sequence"), &CreateSequence);
@@ -928,6 +930,160 @@ TSharedPtr<FJsonValue> FAnimationHandlers::CreateBlendspace(const TSharedPtr<FJs
 }
 
 // ---------------------------------------------------------------------------
+// #248: append a sample to a BlendSpace's SampleData. UBlendSpace::AddSample
+// is the canonical entry point - it validates the position against axis
+// ranges + sets the GridSamples cache so the editor preview matches.
+// ---------------------------------------------------------------------------
+TSharedPtr<FJsonValue> FAnimationHandlers::AddBlendSample(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	if (auto Err = RequireStringAlt(Params, TEXT("assetPath"), TEXT("path"), AssetPath)) return Err;
+
+	UBlendSpace* BlendSpace = LoadAssetByPath<UBlendSpace>(AssetPath);
+	if (!BlendSpace)
+	{
+		return MCPError(FString::Printf(TEXT("BlendSpace not found at '%s'"), *AssetPath));
+	}
+
+	FString AnimationPath;
+	if (auto Err = RequireString(Params, TEXT("animation"), AnimationPath)) return Err;
+	UAnimSequence* Anim = LoadAssetByPath<UAnimSequence>(AnimationPath);
+	if (!Anim)
+	{
+		return MCPError(FString::Printf(TEXT("AnimSequence not found at '%s'"), *AnimationPath));
+	}
+
+	double PosX = 0.0, PosY = 0.0;
+	const TSharedPtr<FJsonObject>* PosObj = nullptr;
+	if (Params->TryGetObjectField(TEXT("position"), PosObj) && PosObj && (*PosObj).IsValid())
+	{
+		(*PosObj)->TryGetNumberField(TEXT("x"), PosX);
+		(*PosObj)->TryGetNumberField(TEXT("y"), PosY);
+	}
+	else
+	{
+		Params->TryGetNumberField(TEXT("x"), PosX);
+		Params->TryGetNumberField(TEXT("y"), PosY);
+	}
+
+	BlendSpace->Modify();
+	const int32 NewSampleIndex = BlendSpace->AddSample(Anim, FVector(PosX, PosY, 0.0));
+	if (NewSampleIndex < 0)
+	{
+		return MCPError(FString::Printf(
+			TEXT("BlendSpace::AddSample rejected position (%.3f, %.3f) - check axis ranges via read_blendspace."),
+			PosX, PosY));
+	}
+	BlendSpace->PostEditChange();
+	SaveAssetPackage(BlendSpace);
+
+	auto Result = MCPSuccess();
+	MCPSetCreated(Result);
+	Result->SetStringField(TEXT("assetPath"), BlendSpace->GetPathName());
+	Result->SetStringField(TEXT("animation"), Anim->GetPathName());
+	Result->SetNumberField(TEXT("sampleIndex"), NewSampleIndex);
+	Result->SetNumberField(TEXT("x"), PosX);
+	Result->SetNumberField(TEXT("y"), PosY);
+	return MCPResult(Result);
+}
+
+// ---------------------------------------------------------------------------
+// #272: relocate an existing BlendSpace sample (and optionally swap its
+// AnimSequence). UBlendSpace::EditSampleValue rewrites coordinates + refreshes
+// the GridSamples cache; the animation ref is swapped via SampleData direct
+// access since there is no first-class setter.
+// ---------------------------------------------------------------------------
+TSharedPtr<FJsonValue> FAnimationHandlers::SetBlendSample(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	if (auto Err = RequireStringAlt(Params, TEXT("assetPath"), TEXT("path"), AssetPath)) return Err;
+
+	UBlendSpace* BlendSpace = LoadAssetByPath<UBlendSpace>(AssetPath);
+	if (!BlendSpace)
+	{
+		return MCPError(FString::Printf(TEXT("BlendSpace not found at '%s'"), *AssetPath));
+	}
+
+	int32 SampleIndex = -1;
+	if (!Params->TryGetNumberField(TEXT("sampleIndex"), SampleIndex))
+	{
+		return MCPError(TEXT("Missing required parameter 'sampleIndex'"));
+	}
+	if (SampleIndex < 0 || SampleIndex >= BlendSpace->GetNumberOfBlendSamples())
+	{
+		return MCPError(FString::Printf(
+			TEXT("sampleIndex %d out of range (0..%d)"),
+			SampleIndex, BlendSpace->GetNumberOfBlendSamples() - 1));
+	}
+
+	const FBlendSample& Existing = BlendSpace->GetBlendSample(SampleIndex);
+	FVector NewPos = Existing.SampleValue;
+
+	const TSharedPtr<FJsonObject>* PosObj = nullptr;
+	bool bHasPos = false;
+	if (Params->TryGetObjectField(TEXT("position"), PosObj) && PosObj && (*PosObj).IsValid())
+	{
+		double PX = NewPos.X, PY = NewPos.Y;
+		(*PosObj)->TryGetNumberField(TEXT("x"), PX);
+		(*PosObj)->TryGetNumberField(TEXT("y"), PY);
+		NewPos = FVector(PX, PY, NewPos.Z);
+		bHasPos = true;
+	}
+	else
+	{
+		double PX = 0, PY = 0;
+		const bool bX = Params->TryGetNumberField(TEXT("x"), PX);
+		const bool bY = Params->TryGetNumberField(TEXT("y"), PY);
+		if (bX || bY)
+		{
+			NewPos = FVector(bX ? PX : NewPos.X, bY ? PY : NewPos.Y, NewPos.Z);
+			bHasPos = true;
+		}
+	}
+
+	BlendSpace->Modify();
+	bool bUpdated = false;
+	if (bHasPos)
+	{
+		BlendSpace->EditSampleValue(SampleIndex, NewPos);
+		bUpdated = true;
+	}
+
+	FString NewAnimPath;
+	if (Params->TryGetStringField(TEXT("animation"), NewAnimPath) && !NewAnimPath.IsEmpty())
+	{
+		UAnimSequence* NewAnim = LoadAssetByPath<UAnimSequence>(NewAnimPath);
+		if (!NewAnim)
+		{
+			return MCPError(FString::Printf(TEXT("AnimSequence not found at '%s'"), *NewAnimPath));
+		}
+		BlendSpace->ReplaceSampleAnimation(SampleIndex, NewAnim);
+		bUpdated = true;
+	}
+
+	if (!bUpdated)
+	{
+		return MCPError(TEXT("Nothing to update - provide position {x,y} and/or animation"));
+	}
+
+	BlendSpace->PostEditChange();
+	SaveAssetPackage(BlendSpace);
+
+	const FBlendSample& Updated = BlendSpace->GetBlendSample(SampleIndex);
+	auto Result = MCPSuccess();
+	MCPSetUpdated(Result);
+	Result->SetStringField(TEXT("assetPath"), BlendSpace->GetPathName());
+	Result->SetNumberField(TEXT("sampleIndex"), SampleIndex);
+	Result->SetNumberField(TEXT("x"), Updated.SampleValue.X);
+	Result->SetNumberField(TEXT("y"), Updated.SampleValue.Y);
+	if (Updated.Animation)
+	{
+		Result->SetStringField(TEXT("animation"), Updated.Animation->GetPathName());
+	}
+	return MCPResult(Result);
+}
+
+// ---------------------------------------------------------------------------
 // create_sequence — Create a blank AnimSequence on a skeleton
 // Params: name, skeletonPath, packagePath?, numFrames?, frameRate?
 // ---------------------------------------------------------------------------
@@ -1175,6 +1331,25 @@ TSharedPtr<FJsonValue> FAnimationHandlers::GetBoneTransforms(const TSharedPtr<FJ
 	const FReferenceSkeleton& RefSkeleton = Skeleton->GetReferenceSkeleton();
 	const TArray<FTransform>& RefPose = RefSkeleton.GetRefBonePose();
 
+	// #245: optional space="component" composes parent transforms so callers
+	// can do retarget-chain / anatomical-scale checks without standing up a
+	// transient SkeletalMeshActor and walking sockets.
+	const FString Space = OptionalString(Params, TEXT("space"), TEXT("local")).ToLower();
+	const bool bComponentSpace = (Space == TEXT("component") || Space == TEXT("world"));
+
+	TArray<FTransform> ComponentSpacePose;
+	if (bComponentSpace)
+	{
+		ComponentSpacePose.SetNum(RefSkeleton.GetNum());
+		for (int32 i = 0; i < RefSkeleton.GetNum(); ++i)
+		{
+			const int32 ParentIdx = RefSkeleton.GetParentIndex(i);
+			ComponentSpacePose[i] = (ParentIdx >= 0)
+				? RefPose[i] * ComponentSpacePose[ParentIdx]
+				: RefPose[i];
+		}
+	}
+
 	// Optional bone name filter
 	TSet<FName> FilterBones;
 	const TArray<TSharedPtr<FJsonValue>>* BoneNamesArray;
@@ -1191,6 +1366,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::GetBoneTransforms(const TSharedPtr<FJ
 	}
 
 	auto Result = MCPSuccess();
+	Result->SetStringField(TEXT("space"), bComponentSpace ? TEXT("component") : TEXT("local"));
 
 	TArray<TSharedPtr<FJsonValue>> BonesArray;
 	for (int32 i = 0; i < RefSkeleton.GetNum(); ++i)
@@ -1198,7 +1374,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::GetBoneTransforms(const TSharedPtr<FJ
 		FName BoneName = RefSkeleton.GetBoneName(i);
 		if (FilterBones.Num() > 0 && !FilterBones.Contains(BoneName)) continue;
 
-		const FTransform& T = RefPose[i];
+		const FTransform& T = bComponentSpace ? ComponentSpacePose[i] : RefPose[i];
 
 		TSharedPtr<FJsonObject> BoneObj = MakeShared<FJsonObject>();
 		BoneObj->SetStringField(TEXT("name"), BoneName.ToString());

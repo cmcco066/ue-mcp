@@ -29,6 +29,10 @@ private:
 	static TSharedPtr<FJsonValue> CreateAnimBlueprint(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> CreateMontage(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> CreateBlendspace(const TSharedPtr<FJsonObject>& Params);
+	// #248: add a sample to a BlendSpace.
+	static TSharedPtr<FJsonValue> AddBlendSample(const TSharedPtr<FJsonObject>& Params);
+	// #272: move an existing sample to new coordinates / swap its animation.
+	static TSharedPtr<FJsonValue> SetBlendSample(const TSharedPtr<FJsonObject>& Params);
 
 	// Notify handlers
 	static TSharedPtr<FJsonValue> AddAnimNotify(const TSharedPtr<FJsonObject>& Params);
