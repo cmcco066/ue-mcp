@@ -187,7 +187,7 @@ static TSharedPtr<FJsonObject> SerializeEditorNode(const FStateTreeEditorNode& N
 
 			// Emit node-struct UPROPERTYs (FStateTreeTaskBase / FStateTreeConditionBase /
 			// FStateTreeEvaluatorBase fields like bConsideredForCompletion, bTaskEnabled,
-			// bShouldCallTick, etc.). Symmetric to instanceProperties below — lets
+			// bShouldCallTick, etc.). Symmetric to instanceProperties below - lets
 			// callers inspect/audit base-flag values.
 			auto NodePropsObj = MakeShared<FJsonObject>();
 			const uint8* NodeMem = Node.Node.GetMemory();
