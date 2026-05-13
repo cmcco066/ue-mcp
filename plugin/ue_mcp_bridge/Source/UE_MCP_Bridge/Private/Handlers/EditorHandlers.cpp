@@ -926,7 +926,7 @@ TSharedPtr<FJsonValue> FEditorHandlers::SaveDirty(const TSharedPtr<FJsonObject>&
 		const bool bIsMap = Pkg->ContainsMap();
 		if (bIsMap && !bIncludeMaps) continue;
 		if (!bIsMap && !bIncludeContent) continue;
-		// Skip code modules + transient packages — only flush content packages
+		// Skip code modules + transient packages - only flush content packages
 		// that live in mounted Content directories (have a resolvable .uasset
 		// filename). Engine code packages like /Script/Engine should never be
 		// touched by a content-save flush.
