@@ -109,6 +109,7 @@ void FGameplayHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("set_world_game_mode"), &SetWorldGameMode);
 	Registry.RegisterHandler(TEXT("create_ai_perception_config"), &CreateAiPerceptionConfig);
 	Registry.RegisterHandler(TEXT("add_blackboard_key"), &AddBlackboardKey);
+	Registry.RegisterHandler(TEXT("set_behavior_tree_blackboard"), &SetBehaviorTreeBlackboard);
 	Registry.RegisterHandler(TEXT("setup_enhanced_input"), &SetupEnhancedInput);
 	Registry.RegisterHandler(TEXT("configure_behavior_tree"), &ConfigureBehaviorTree);
 	Registry.RegisterHandler(TEXT("setup_path_following"), &SetupPathFollowing);
@@ -1360,6 +1361,53 @@ TSharedPtr<FJsonValue> FGameplayHandlers::AddBlackboardKey(const TSharedPtr<FJso
 
 	return MCPResult(Result);
 }
+
+// #250: rebind a BehaviorTree asset's BlackboardAsset reference. The field is
+// `protected` in C++ so direct writes need reflection; Python set_editor_property
+// also can't reach it because the UPROPERTY is BlueprintReadOnly.
+TSharedPtr<FJsonValue> FGameplayHandlers::SetBehaviorTreeBlackboard(const TSharedPtr<FJsonObject>& Params)
+{
+	FString BehaviorTreePath;
+	if (auto Err = RequireString(Params, TEXT("behaviorTreePath"), BehaviorTreePath)) return Err;
+
+	FString BlackboardPath;
+	if (auto Err = RequireString(Params, TEXT("blackboardPath"), BlackboardPath)) return Err;
+
+	UBehaviorTree* BT = LoadObject<UBehaviorTree>(nullptr, *BehaviorTreePath);
+	if (!BT) return MCPError(FString::Printf(TEXT("BehaviorTree not found: %s"), *BehaviorTreePath));
+
+	UBlackboardData* BB = LoadObject<UBlackboardData>(nullptr, *BlackboardPath);
+	if (!BB) return MCPError(FString::Printf(TEXT("BlackboardData not found: %s"), *BlackboardPath));
+
+	FObjectProperty* BBProp = CastField<FObjectProperty>(BT->GetClass()->FindPropertyByName(TEXT("BlackboardAsset")));
+	if (!BBProp)
+	{
+		return MCPError(TEXT("BehaviorTree class has no BlackboardAsset property - engine version drift?"));
+	}
+
+	UBlackboardData* Previous = Cast<UBlackboardData>(BBProp->GetObjectPropertyValue_InContainer(BT));
+
+	BT->Modify();
+	BBProp->SetObjectPropertyValue_InContainer(BT, BB);
+	BT->PostEditChange();
+	SaveAssetPackage(BT);
+
+	auto Result = MCPSuccess();
+	MCPSetUpdated(Result);
+	Result->SetStringField(TEXT("behaviorTreePath"), BehaviorTreePath);
+	Result->SetStringField(TEXT("blackboardPath"), BlackboardPath);
+	if (Previous)
+	{
+		Result->SetStringField(TEXT("previousBlackboard"), Previous->GetPathName());
+
+		TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+		Payload->SetStringField(TEXT("behaviorTreePath"), BehaviorTreePath);
+		Payload->SetStringField(TEXT("blackboardPath"), Previous->GetPathName());
+		MCPSetRollback(Result, TEXT("set_behavior_tree_blackboard"), Payload);
+	}
+	return MCPResult(Result);
+}
+
 TSharedPtr<FJsonValue> FGameplayHandlers::ConfigureBehaviorTree(const TSharedPtr<FJsonObject>& Params)
 {
 	FString ActorLabel;

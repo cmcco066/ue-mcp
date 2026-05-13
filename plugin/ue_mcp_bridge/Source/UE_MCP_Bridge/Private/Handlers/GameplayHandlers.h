@@ -39,6 +39,9 @@ private:
 	static TSharedPtr<FJsonValue> SetWorldGameMode(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> CreateAiPerceptionConfig(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> AddBlackboardKey(const TSharedPtr<FJsonObject>& Params);
+	// #250: rebind a BehaviorTree asset's BlackboardAsset (the C++ field is
+	// protected, so reflection is the only way to write it cleanly).
+	static TSharedPtr<FJsonValue> SetBehaviorTreeBlackboard(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> SetupEnhancedInput(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> ConfigureBehaviorTree(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> SetupPathFollowing(const TSharedPtr<FJsonObject>& Params);
