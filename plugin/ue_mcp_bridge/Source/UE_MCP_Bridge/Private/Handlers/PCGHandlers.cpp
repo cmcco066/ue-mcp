@@ -276,6 +276,7 @@ void FPCGHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("read_pcg_graph"), &ReadPCGGraph);
 	Registry.RegisterHandler(TEXT("add_pcg_node"), &AddPCGNode);
 	Registry.RegisterHandler(TEXT("connect_pcg_nodes"), &ConnectPCGNodes);
+	Registry.RegisterHandler(TEXT("disconnect_pcg_nodes"), &DisconnectPCGNodes);
 	Registry.RegisterHandler(TEXT("remove_pcg_node"), &RemovePCGNode);
 	Registry.RegisterHandler(TEXT("set_pcg_node_settings"), &SetPCGNodeSettings);
 	Registry.RegisterHandler(TEXT("execute_pcg_graph"), &ExecutePCGGraph);
@@ -706,6 +707,8 @@ TSharedPtr<FJsonValue> FPCGHandlers::ConnectPCGNodes(const TSharedPtr<FJsonObjec
 
 	FScopedTransaction Transaction(NSLOCTEXT("UEMCPBridge", "ConnectPCGNodes", "Connect PCG Nodes"));
 	Graph->Modify();
+	SourceNode->Modify();
+	TargetNode->Modify();
 
 	UPCGNode* ResultNode = Graph->AddEdge(SourceNode, ResolvedSourcePinLabel, TargetNode, ResolvedTargetPinLabel);
 	if (!ResultNode)
@@ -713,6 +716,43 @@ TSharedPtr<FJsonValue> FPCGHandlers::ConnectPCGNodes(const TSharedPtr<FJsonObjec
 		return MCPError(TEXT("Failed to connect pins - connection may already exist or be incompatible"));
 	}
 
+	// #304: AddEdge has shipped variants that report success while failing to
+	// instantiate the UPCGEdge object on the pin. Verify by walking the source
+	// pin's Edges array post-call. If the edge is missing, surface the failure
+	// instead of returning a green response that maps to a phantom connection.
+	auto FindPinByLabel = [](const TArray<TObjectPtr<UPCGPin>>& Pins, FName Label) -> UPCGPin*
+	{
+		for (const TObjectPtr<UPCGPin>& P : Pins)
+		{
+			if (P && P->Properties.Label == Label) return P;
+		}
+		return nullptr;
+	};
+	UPCGPin* SrcPin = FindPinByLabel(SourceNode->GetOutputPins(), ResolvedSourcePinLabel);
+	UPCGPin* DstPin = FindPinByLabel(TargetNode->GetInputPins(), ResolvedTargetPinLabel);
+	bool bEdgeVerified = false;
+	if (SrcPin && DstPin)
+	{
+		for (const TObjectPtr<UPCGEdge>& Edge : SrcPin->Edges)
+		{
+			if (Edge && Edge->InputPin == SrcPin && Edge->OutputPin == DstPin)
+			{
+				bEdgeVerified = true;
+				break;
+			}
+		}
+	}
+	if (!bEdgeVerified)
+	{
+		return MCPError(FString::Printf(
+			TEXT("AddEdge returned success but no UPCGEdge was found on '%s.%s' -> '%s.%s'. ")
+			TEXT("Pin labels likely mismatch the node's declared pins."),
+			*SourceNodeName, *ResolvedSourcePinLabel.ToString(),
+			*TargetNodeName, *ResolvedTargetPinLabel.ToString()));
+	}
+
+	SourceNode->PostEditChange();
+	TargetNode->PostEditChange();
 	Graph->PostEditChange();
 	if (UPackage* Pkg = Graph->GetOutermost()) { Pkg->MarkPackageDirty(); }
 
@@ -724,6 +764,121 @@ TSharedPtr<FJsonValue> FPCGHandlers::ConnectPCGNodes(const TSharedPtr<FJsonObjec
 	Result->SetStringField(TEXT("targetNodeName"), TargetNodeName);
 	Result->SetStringField(TEXT("sourcePinLabel"), ResolvedSourcePinLabel.ToString());
 	Result->SetStringField(TEXT("targetPinLabel"), ResolvedTargetPinLabel.ToString());
+	Result->SetBoolField(TEXT("edgeVerified"), true);
+
+	// Rollback: disconnect the freshly-added edge.
+	TSharedPtr<FJsonObject> RollbackPayload = MakeShared<FJsonObject>();
+	RollbackPayload->SetStringField(TEXT("assetPath"), AssetPath);
+	RollbackPayload->SetStringField(TEXT("sourceNodeName"), SourceNodeName);
+	RollbackPayload->SetStringField(TEXT("targetNodeName"), TargetNodeName);
+	RollbackPayload->SetStringField(TEXT("sourcePinLabel"), ResolvedSourcePinLabel.ToString());
+	RollbackPayload->SetStringField(TEXT("targetPinLabel"), ResolvedTargetPinLabel.ToString());
+	MCPSetRollback(Result, TEXT("disconnect_pcg_nodes"), RollbackPayload);
+
+	return MCPResult(Result);
+}
+
+// #346: per-edge removal. UPCGGraph has no public RemoveEdge; do it manually by
+// finding the matching UPCGEdge on the source pin and clearing it from both
+// pins' Edges arrays, then PostEditChange + save.
+TSharedPtr<FJsonValue> FPCGHandlers::DisconnectPCGNodes(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	if (auto Err = RequireStringAlt(Params, TEXT("assetPath"), TEXT("path"), AssetPath)) return Err;
+
+	FString SourceNodeName;
+	if (auto Err = RequireStringAlt(Params, TEXT("sourceNodeName"), TEXT("sourceNode"), SourceNodeName)) return Err;
+
+	FString TargetNodeName;
+	if (auto Err = RequireStringAlt(Params, TEXT("targetNodeName"), TEXT("targetNode"), TargetNodeName)) return Err;
+
+	UPCGGraph* Graph = LoadObject<UPCGGraph>(nullptr, *AssetPath);
+	if (!Graph)
+	{
+		return MCPError(FString::Printf(TEXT("PCGGraph not found: %s"), *AssetPath));
+	}
+
+	UPCGNode* SourceNode = nullptr;
+	UPCGNode* TargetNode = nullptr;
+	for (UPCGNode* Node : Graph->GetNodes())
+	{
+		if (!Node) continue;
+		if (Node->GetName() == SourceNodeName) SourceNode = Node;
+		if (Node->GetName() == TargetNodeName) TargetNode = Node;
+	}
+	if (!SourceNode && Graph->GetInputNode() && Graph->GetInputNode()->GetName() == SourceNodeName)
+	{
+		SourceNode = Graph->GetInputNode();
+	}
+	if (!TargetNode && Graph->GetOutputNode() && Graph->GetOutputNode()->GetName() == TargetNodeName)
+	{
+		TargetNode = Graph->GetOutputNode();
+	}
+	if (!SourceNode) return MCPError(FString::Printf(TEXT("Source node not found: %s"), *SourceNodeName));
+	if (!TargetNode) return MCPError(FString::Printf(TEXT("Target node not found: %s"), *TargetNodeName));
+
+	FString SourcePinLabel = OptionalString(Params, TEXT("sourcePinLabel"));
+	if (SourcePinLabel.IsEmpty()) SourcePinLabel = OptionalString(Params, TEXT("sourcePin"));
+	FString TargetPinLabel = OptionalString(Params, TEXT("targetPinLabel"));
+	if (TargetPinLabel.IsEmpty()) TargetPinLabel = OptionalString(Params, TEXT("targetPin"));
+
+	FScopedTransaction Transaction(NSLOCTEXT("UEMCPBridge", "DisconnectPCGNodes", "Disconnect PCG Nodes"));
+	Graph->Modify();
+	SourceNode->Modify();
+	TargetNode->Modify();
+
+	int32 RemovedCount = 0;
+	for (const TObjectPtr<UPCGPin>& OutPin : SourceNode->GetOutputPins())
+	{
+		if (!OutPin) continue;
+		if (!SourcePinLabel.IsEmpty() && OutPin->Properties.Label != FName(*SourcePinLabel)) continue;
+
+		// Mutating the Edges array during iteration is unsafe; collect first.
+		TArray<UPCGEdge*> ToRemove;
+		for (const TObjectPtr<UPCGEdge>& Edge : OutPin->Edges)
+		{
+			if (!Edge || !Edge->OutputPin) continue;
+			UPCGNode* EdgeDstNode = Edge->OutputPin->Node;
+			if (EdgeDstNode != TargetNode) continue;
+			if (!TargetPinLabel.IsEmpty() && Edge->OutputPin->Properties.Label != FName(*TargetPinLabel)) continue;
+			ToRemove.Add(Edge);
+		}
+		for (UPCGEdge* Edge : ToRemove)
+		{
+			if (!Edge) continue;
+			if (Edge->OutputPin)
+			{
+				Edge->OutputPin->Edges.Remove(Edge);
+			}
+			OutPin->Edges.Remove(Edge);
+			RemovedCount++;
+		}
+	}
+
+	if (RemovedCount == 0)
+	{
+		auto Noop = MCPSuccess();
+		MCPSetExisted(Noop);
+		Noop->SetStringField(TEXT("assetPath"), AssetPath);
+		Noop->SetStringField(TEXT("sourceNodeName"), SourceNodeName);
+		Noop->SetStringField(TEXT("targetNodeName"), TargetNodeName);
+		Noop->SetNumberField(TEXT("removedEdges"), 0);
+		Noop->SetBoolField(TEXT("alreadyDisconnected"), true);
+		return MCPResult(Noop);
+	}
+
+	SourceNode->PostEditChange();
+	TargetNode->PostEditChange();
+	Graph->PostEditChange();
+	if (UPackage* Pkg = Graph->GetOutermost()) { Pkg->MarkPackageDirty(); }
+	UEditorAssetLibrary::SaveLoadedAsset(Graph, /*bOnlyIfIsDirty=*/false);
+
+	auto Result = MCPSuccess();
+	MCPSetUpdated(Result);
+	Result->SetStringField(TEXT("assetPath"), AssetPath);
+	Result->SetStringField(TEXT("sourceNodeName"), SourceNodeName);
+	Result->SetStringField(TEXT("targetNodeName"), TargetNodeName);
+	Result->SetNumberField(TEXT("removedEdges"), RemovedCount);
 	return MCPResult(Result);
 }
 
@@ -1723,13 +1878,49 @@ TSharedPtr<FJsonValue> FPCGHandlers::ImportGraph(const TSharedPtr<FJsonObject>& 
 				continue;
 			}
 
-			if (Graph->AddEdge(SrcNode, SrcPinName, DstNode, DstPinName))
+			SrcNode->Modify();
+			DstNode->Modify();
+			if (!Graph->AddEdge(SrcNode, SrcPinName, DstNode, DstPinName))
+			{
+				Warnings.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT("connection %s.%s -> %s.%s: AddEdge failed (incompatible or duplicate?)"), *From, *SrcPinName.ToString(), *To, *DstPinName.ToString())));
+				continue;
+			}
+			// #304: verify the UPCGEdge object was actually instantiated. Some
+			// pin/label combinations return success from AddEdge while leaving
+			// no edge in either pin's Edges array; those phantom connections
+			// were previously counted toward connectionsMade and made the
+			// import look healthier than the on-disk asset.
+			UPCGPin* VerifySrcPin = nullptr;
+			UPCGPin* VerifyDstPin = nullptr;
+			for (const TObjectPtr<UPCGPin>& P : SrcNode->GetOutputPins())
+			{
+				if (P && P->Properties.Label == SrcPinName) { VerifySrcPin = P; break; }
+			}
+			for (const TObjectPtr<UPCGPin>& P : DstNode->GetInputPins())
+			{
+				if (P && P->Properties.Label == DstPinName) { VerifyDstPin = P; break; }
+			}
+			bool bVerified = false;
+			if (VerifySrcPin && VerifyDstPin)
+			{
+				for (const TObjectPtr<UPCGEdge>& Edge : VerifySrcPin->Edges)
+				{
+					if (Edge && Edge->InputPin == VerifySrcPin && Edge->OutputPin == VerifyDstPin)
+					{
+						bVerified = true;
+						break;
+					}
+				}
+			}
+			if (bVerified)
 			{
 				++ConnectionsMade;
 			}
 			else
 			{
-				Warnings.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT("connection %s.%s -> %s.%s: AddEdge failed (incompatible or duplicate?)"), *From, *SrcPinName.ToString(), *To, *DstPinName.ToString())));
+				Warnings.Add(MakeShared<FJsonValueString>(FString::Printf(
+					TEXT("connection %s.%s -> %s.%s: AddEdge returned success but no UPCGEdge persisted (pin label mismatch?)"),
+					*From, *SrcPinName.ToString(), *To, *DstPinName.ToString())));
 			}
 		}
 	}
