@@ -16,6 +16,9 @@ private:
 	static TSharedPtr<FJsonValue> PlaceActor(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> DeleteActor(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> GetActorDetails(const TSharedPtr<FJsonObject>& Params);
+	// #240/#241/#302/#320/#370/#353: deep component-tree introspection - per-component
+	// attach topology + transforms + collision + mesh/material refs + reflected properties.
+	static TSharedPtr<FJsonValue> GetComponentTree(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> GetCurrentLevel(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> ListLevels(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> GetSelectedActors(const TSharedPtr<FJsonObject>& Params);

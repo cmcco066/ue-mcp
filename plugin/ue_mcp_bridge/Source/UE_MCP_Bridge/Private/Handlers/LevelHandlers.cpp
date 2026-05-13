@@ -55,6 +55,8 @@
 #include "Engine/StaticMeshActor.h"
 #include "Components/StaticMeshComponent.h"
 #include "Engine/StaticMesh.h"
+#include "Components/SkeletalMeshComponent.h"
+#include "Engine/SkeletalMesh.h"
 #include "Materials/MaterialInterface.h"
 #include "HandlerJsonProperty.h"
 
@@ -64,6 +66,7 @@ void FLevelHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("place_actor"), &PlaceActor);
 	Registry.RegisterHandler(TEXT("delete_actor"), &DeleteActor);
 	Registry.RegisterHandler(TEXT("get_actor_details"), &GetActorDetails);
+	Registry.RegisterHandler(TEXT("get_component_tree"), &GetComponentTree);
 	Registry.RegisterHandler(TEXT("get_current_level"), &GetCurrentLevel);
 	Registry.RegisterHandler(TEXT("list_levels"), &ListLevels);
 	Registry.RegisterHandler(TEXT("get_selected_actors"), &GetSelectedActors);
@@ -484,6 +487,215 @@ TSharedPtr<FJsonValue> FLevelHandlers::GetActorDetails(const TSharedPtr<FJsonObj
 		Result->SetNumberField(TEXT("propertyCount"), PropsArr.Num());
 	}
 
+	return MCPResult(Result);
+}
+
+// #240/#241/#302/#320/#370/#353: deep component-tree introspection.
+//
+// Single call returns the actor's component list with all the inspection
+// data that previously required either a tower of blueprint.get_component_property
+// calls or a fall-back to execute_python with subclass-specific accessors.
+// Covers:
+//   - attach topology (parent + socket)
+//   - relative + world transforms
+//   - mobility + visibility
+//   - collision profile + enabled state for PrimitiveComponents
+//   - mesh path + override materials for StaticMesh / SkeletalMesh / SplineMesh
+//   - bounds (origin + extent) for PrimitiveComponents
+//   - tags
+//   - reflected UPROPERTY name/type/value when includeProperties=true
+TSharedPtr<FJsonValue> FLevelHandlers::GetComponentTree(const TSharedPtr<FJsonObject>& Params)
+{
+	FString ActorLabel;
+	FString ActorPath;
+	const bool bHasLabel = Params->TryGetStringField(TEXT("actorLabel"), ActorLabel);
+	const bool bHasPath = Params->TryGetStringField(TEXT("actorPath"), ActorPath);
+	if (!bHasLabel && !bHasPath)
+	{
+		return MCPError(TEXT("Missing 'actorLabel' or 'actorPath' parameter"));
+	}
+
+	const FString WorldScope = OptionalString(Params, TEXT("world"), TEXT("editor"));
+	UWorld* World = ResolveWorldScope(WorldScope);
+	if (!World)
+	{
+		return MCPError(FString::Printf(TEXT("World '%s' not available"), *WorldScope));
+	}
+
+	AActor* Actor = nullptr;
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		if (bHasPath && (*It)->GetPathName() == ActorPath) { Actor = *It; break; }
+		if (bHasLabel && (*It)->GetActorLabel() == ActorLabel) { Actor = *It; break; }
+	}
+	if (!Actor)
+	{
+		return MCPError(FString::Printf(TEXT("Actor not found: %s"), bHasPath ? *ActorPath : *ActorLabel));
+	}
+
+	const bool bIncludeProperties = OptionalBool(Params, TEXT("includeProperties"));
+	const FString PropertyFilter = OptionalString(Params, TEXT("componentClass"));
+
+	TArray<UActorComponent*> Components;
+	Actor->GetComponents(Components);
+
+	TArray<TSharedPtr<FJsonValue>> CompArr;
+	for (UActorComponent* Comp : Components)
+	{
+		if (!Comp) continue;
+		if (!PropertyFilter.IsEmpty() && !Comp->GetClass()->GetName().Contains(PropertyFilter, ESearchCase::IgnoreCase)) continue;
+
+		TSharedPtr<FJsonObject> C = MakeShared<FJsonObject>();
+		C->SetStringField(TEXT("name"), Comp->GetName());
+		C->SetStringField(TEXT("class"), Comp->GetClass()->GetName());
+		C->SetBoolField(TEXT("isEditorOnly"), Comp->IsEditorOnly());
+
+		// Tags array
+		TArray<TSharedPtr<FJsonValue>> TagArr;
+		for (FName Tag : Comp->ComponentTags) { TagArr.Add(MakeShared<FJsonValueString>(Tag.ToString())); }
+		C->SetArrayField(TEXT("tags"), TagArr);
+
+		if (USceneComponent* SC = Cast<USceneComponent>(Comp))
+		{
+			// Attach topology
+			if (USceneComponent* AttachParent = SC->GetAttachParent())
+			{
+				C->SetStringField(TEXT("attachParent"), AttachParent->GetName());
+			}
+			const FName SocketName = SC->GetAttachSocketName();
+			if (SocketName != NAME_None)
+			{
+				C->SetStringField(TEXT("attachSocket"), SocketName.ToString());
+			}
+
+			// Visibility + mobility
+			C->SetBoolField(TEXT("bVisible"), SC->IsVisible());
+			switch (SC->Mobility)
+			{
+			case EComponentMobility::Static:     C->SetStringField(TEXT("mobility"), TEXT("Static")); break;
+			case EComponentMobility::Stationary: C->SetStringField(TEXT("mobility"), TEXT("Stationary")); break;
+			case EComponentMobility::Movable:    C->SetStringField(TEXT("mobility"), TEXT("Movable")); break;
+			default: break;
+			}
+
+			// Relative transform
+			const FVector RelLoc = SC->GetRelativeLocation();
+			const FRotator RelRot = SC->GetRelativeRotation();
+			const FVector RelScale = SC->GetRelativeScale3D();
+			auto MakeVec = [](const FVector& V) {
+				auto O = MakeShared<FJsonObject>();
+				O->SetNumberField(TEXT("x"), V.X);
+				O->SetNumberField(TEXT("y"), V.Y);
+				O->SetNumberField(TEXT("z"), V.Z);
+				return O;
+			};
+			auto MakeRot = [](const FRotator& R) {
+				auto O = MakeShared<FJsonObject>();
+				O->SetNumberField(TEXT("pitch"), R.Pitch);
+				O->SetNumberField(TEXT("yaw"), R.Yaw);
+				O->SetNumberField(TEXT("roll"), R.Roll);
+				return O;
+			};
+			C->SetObjectField(TEXT("relativeLocation"), MakeVec(RelLoc));
+			C->SetObjectField(TEXT("relativeRotation"), MakeRot(RelRot));
+			C->SetObjectField(TEXT("relativeScale"), MakeVec(RelScale));
+
+			// World transform
+			C->SetObjectField(TEXT("worldLocation"), MakeVec(SC->GetComponentLocation()));
+			C->SetObjectField(TEXT("worldRotation"), MakeRot(SC->GetComponentRotation()));
+			C->SetObjectField(TEXT("worldScale"), MakeVec(SC->GetComponentScale()));
+
+			if (UPrimitiveComponent* PC = Cast<UPrimitiveComponent>(SC))
+			{
+				// Collision profile
+				const FName CollisionProfile = PC->GetCollisionProfileName();
+				C->SetStringField(TEXT("collisionProfile"), CollisionProfile.ToString());
+				switch (PC->GetCollisionEnabled())
+				{
+				case ECollisionEnabled::NoCollision:        C->SetStringField(TEXT("collisionEnabled"), TEXT("NoCollision")); break;
+				case ECollisionEnabled::QueryOnly:          C->SetStringField(TEXT("collisionEnabled"), TEXT("QueryOnly")); break;
+				case ECollisionEnabled::PhysicsOnly:        C->SetStringField(TEXT("collisionEnabled"), TEXT("PhysicsOnly")); break;
+				case ECollisionEnabled::QueryAndPhysics:    C->SetStringField(TEXT("collisionEnabled"), TEXT("QueryAndPhysics")); break;
+				case ECollisionEnabled::ProbeOnly:          C->SetStringField(TEXT("collisionEnabled"), TEXT("ProbeOnly")); break;
+				case ECollisionEnabled::QueryAndProbe:      C->SetStringField(TEXT("collisionEnabled"), TEXT("QueryAndProbe")); break;
+				default: break;
+				}
+				C->SetBoolField(TEXT("castShadow"), PC->CastShadow);
+
+				// Bounds
+				const FBoxSphereBounds Bounds = PC->Bounds;
+				C->SetObjectField(TEXT("boundsOrigin"), MakeVec(Bounds.Origin));
+				C->SetObjectField(TEXT("boundsBoxExtent"), MakeVec(Bounds.BoxExtent));
+				C->SetNumberField(TEXT("boundsSphereRadius"), Bounds.SphereRadius);
+
+				// Material slots + meshes (mesh-component subclasses)
+				if (UStaticMeshComponent* SMC = Cast<UStaticMeshComponent>(PC))
+				{
+					if (UStaticMesh* Mesh = SMC->GetStaticMesh())
+					{
+						C->SetStringField(TEXT("staticMesh"), Mesh->GetPathName());
+					}
+					TArray<TSharedPtr<FJsonValue>> Mats;
+					const int32 NumMats = SMC->GetNumMaterials();
+					for (int32 i = 0; i < NumMats; i++)
+					{
+						UMaterialInterface* Mat = SMC->GetMaterial(i);
+						Mats.Add(MakeShared<FJsonValueString>(Mat ? Mat->GetPathName() : TEXT("")));
+					}
+					C->SetArrayField(TEXT("materials"), Mats);
+				}
+				else if (USkeletalMeshComponent* SKMC = Cast<USkeletalMeshComponent>(PC))
+				{
+					if (USkeletalMesh* Mesh = SKMC->GetSkeletalMeshAsset())
+					{
+						C->SetStringField(TEXT("skeletalMesh"), Mesh->GetPathName());
+					}
+					TArray<TSharedPtr<FJsonValue>> Mats;
+					const int32 NumMats = SKMC->GetNumMaterials();
+					for (int32 i = 0; i < NumMats; i++)
+					{
+						UMaterialInterface* Mat = SKMC->GetMaterial(i);
+						Mats.Add(MakeShared<FJsonValueString>(Mat ? Mat->GetPathName() : TEXT("")));
+					}
+					C->SetArrayField(TEXT("materials"), Mats);
+					if (USkeleton* Skel = SKMC->GetSkeletalMeshAsset() ? SKMC->GetSkeletalMeshAsset()->GetSkeleton() : nullptr)
+					{
+						C->SetStringField(TEXT("skeleton"), Skel->GetPathName());
+					}
+				}
+			}
+		}
+
+		if (bIncludeProperties)
+		{
+			TArray<TSharedPtr<FJsonValue>> Props;
+			for (TFieldIterator<FProperty> PIt(Comp->GetClass()); PIt; ++PIt)
+			{
+				FProperty* Prop = *PIt;
+				if (!Prop) continue;
+				// Skip uneditable / hidden flagged fields to keep the payload focused
+				// on values an agent would actually inspect.
+				if (Prop->HasAnyPropertyFlags(CPF_Transient | CPF_DuplicateTransient | CPF_DisableEditOnInstance)) continue;
+				TSharedPtr<FJsonObject> P = MakeShared<FJsonObject>();
+				P->SetStringField(TEXT("name"), Prop->GetName());
+				P->SetStringField(TEXT("type"), Prop->GetCPPType());
+				FString ValueStr;
+				const void* VP = Prop->ContainerPtrToValuePtr<void>(Comp);
+				Prop->ExportText_Direct(ValueStr, VP, VP, Comp, PPF_None);
+				P->SetStringField(TEXT("value"), ValueStr);
+				Props.Add(MakeShared<FJsonValueObject>(P));
+			}
+			C->SetArrayField(TEXT("properties"), Props);
+		}
+
+		CompArr.Add(MakeShared<FJsonValueObject>(C));
+	}
+
+	auto Result = MCPSuccess();
+	Result->SetStringField(TEXT("actorLabel"), Actor->GetActorLabel());
+	Result->SetStringField(TEXT("actorClass"), Actor->GetClass()->GetName());
+	Result->SetNumberField(TEXT("componentCount"), CompArr.Num());
+	Result->SetArrayField(TEXT("components"), CompArr);
 	return MCPResult(Result);
 }
 

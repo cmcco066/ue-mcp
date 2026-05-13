@@ -883,6 +883,32 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ReadBlueprint(const TSharedPtr<FJsonO
 		return MCPError(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
 	}
 
+	// #353/#370: per-component property dump on demand. Off by default so the
+	// common read stays small; flip on when the caller wants the full UPROPERTY
+	// values from each component template (e.g. AIPerceptionStimuliSourceComponent's
+	// bAutoRegisterAsSource for a read-then-modify flow).
+	const bool bIncludeComponentProperties = OptionalBool(Params, TEXT("includeComponentProperties"));
+	auto AppendComponentProperties = [&bIncludeComponentProperties](TSharedPtr<FJsonObject> CompObj, UActorComponent* Template)
+	{
+		if (!bIncludeComponentProperties || !Template) return;
+		TArray<TSharedPtr<FJsonValue>> Props;
+		for (TFieldIterator<FProperty> PIt(Template->GetClass()); PIt; ++PIt)
+		{
+			FProperty* Prop = *PIt;
+			if (!Prop) continue;
+			if (Prop->HasAnyPropertyFlags(CPF_Transient | CPF_DuplicateTransient)) continue;
+			TSharedPtr<FJsonObject> P = MakeShared<FJsonObject>();
+			P->SetStringField(TEXT("name"), Prop->GetName());
+			P->SetStringField(TEXT("type"), Prop->GetCPPType());
+			FString ValueStr;
+			const void* VP = Prop->ContainerPtrToValuePtr<void>(Template);
+			Prop->ExportText_Direct(ValueStr, VP, VP, Template, PPF_None);
+			P->SetStringField(TEXT("value"), ValueStr);
+			Props.Add(MakeShared<FJsonValueObject>(P));
+		}
+		CompObj->SetArrayField(TEXT("properties"), Props);
+	};
+
 	auto Result = MCPSuccess();
 	Result->SetStringField(TEXT("path"), AssetPath);
 	Result->SetStringField(TEXT("className"), Blueprint->GetName());
@@ -994,7 +1020,41 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ReadBlueprint(const TSharedPtr<FJsonO
 				}
 			}
 
+			AppendComponentProperties(CompObj, Template);
 			ComponentsArray.Add(MakeShared<FJsonValueObject>(CompObj));
+		}
+	}
+
+	// #353: inherited native components (e.g. CharacterMesh0, CharMoveComp on
+	// ACharacter) live on the parent class' CDO, not in the BP's SCS. Walk the
+	// generated class' default subobjects so the response covers the full
+	// effective component list, not just the BP-authored slice.
+	if (UClass* GenClass = Blueprint->GeneratedClass)
+	{
+		if (AActor* CDOActor = Cast<AActor>(GenClass->GetDefaultObject()))
+		{
+			TArray<UActorComponent*> AllComps;
+			CDOActor->GetComponents(AllComps);
+			for (UActorComponent* Comp : AllComps)
+			{
+				if (!Comp) continue;
+				// Skip components that came from the SCS (already emitted above).
+				if (Comp->CreationMethod == EComponentCreationMethod::SimpleConstructionScript) continue;
+				TSharedPtr<FJsonObject> CompObj = MakeShared<FJsonObject>();
+				CompObj->SetStringField(TEXT("name"), Comp->GetName());
+				CompObj->SetStringField(TEXT("class"), Comp->GetClass()->GetName());
+				CompObj->SetStringField(TEXT("origin"), TEXT("native"));
+				if (USceneComponent* SC = Cast<USceneComponent>(Comp))
+				{
+					TSharedPtr<FJsonObject> Loc = MakeShared<FJsonObject>();
+					Loc->SetNumberField(TEXT("x"), SC->GetRelativeLocation().X);
+					Loc->SetNumberField(TEXT("y"), SC->GetRelativeLocation().Y);
+					Loc->SetNumberField(TEXT("z"), SC->GetRelativeLocation().Z);
+					CompObj->SetObjectField(TEXT("relativeLocation"), Loc);
+				}
+				AppendComponentProperties(CompObj, Comp);
+				ComponentsArray.Add(MakeShared<FJsonValueObject>(CompObj));
+			}
 		}
 	}
 	Result->SetArrayField(TEXT("components"), ComponentsArray);

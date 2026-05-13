@@ -5,7 +5,7 @@ export const blueprintTool: ToolDef = categoryTool(
   "blueprint",
   "Blueprint reading, authoring, and compilation. Covers variables, functions, graphs, nodes, components, interfaces, and event dispatchers.",
   {
-    read:              bp("Read BP structure incl. SCS components. Params: assetPath", "read_blueprint", (p) => ({ path: p.assetPath })),
+    read:              bp("Read BP structure incl. SCS components AND inherited native components from the CDO (CharacterMesh0, CharMoveComp, etc.). Params: assetPath, includeComponentProperties? (dump UPROPERTY name/type/value per component template; off by default) (#353/#370)", "read_blueprint", (p) => ({ path: p.assetPath, includeComponentProperties: p.includeComponentProperties })),
     list_variables:    bp("List variables. Params: assetPath", "list_blueprint_variables", (p) => ({ path: p.assetPath })),
     list_functions:    bp("List functions/graphs. Params: assetPath", "list_blueprint_functions", (p) => ({ path: p.assetPath })),
     read_graph:        bp("Read graph nodes. Params: assetPath, graphName", "read_blueprint_graph", (p) => ({ path: p.assetPath, graphName: p.graphName })),
@@ -86,6 +86,7 @@ export const blueprintTool: ToolDef = categoryTool(
     blueprintPath: z.string().optional(), interfacePath: z.string().optional(),
     entryPoint: z.string().optional().describe("Event/function name to start exec-flow trace"),
     reverse: z.boolean().optional().describe("get_dependencies: true → referencers of this asset"),
+    includeComponentProperties: z.boolean().optional().describe("read: dump UPROPERTY name/type/value per component template (#353/#370)"),
     sourcePath: z.string().optional(), destinationPath: z.string().optional(),
     nodeIds: z.array(z.string()).optional().describe("Node guids/names to export (omit = whole graph)"),
     t3d: z.string().optional().describe("T3D blob from export_nodes_t3d (or copied from the BP graph editor)"),
